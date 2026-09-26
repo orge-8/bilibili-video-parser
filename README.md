@@ -103,8 +103,20 @@ pip install httpx pillow
 
 ## 权限/能力
 
-- capabilities：`send.text`（命令回复）、`llm.generate`（L2 关键帧识别与总结）
-- 不调用适配器 API，不依赖 napcat-adapter
+- capabilities：`send.text`（命令回复）、`llm.generate`（L2 关键帧识别与总结）、`api.call`（小程序卡片 NapCat get_msg 回查，v1.0.5 起声明）
+- 不调用适配器 HTTP API，不需要 NapCat 开 HTTP 服务器；get_msg 走插件 API 隧道
+  （Host 转发到 Napcat-Adapter 插件暴露的 `adapter.napcat.message.get_msg`）
+- Napcat-Adapter 需为官方 Mai-with-u 版 v1.2.0+（该版本起暴露插件 API）
+
+## v1.0.5 修复：api.call 能力声明 + 反查观测
+
+- **根因（18:53 真机日志）**：`get_msg(ctx.api) 失败: RPCError`——manifest 未声明
+  `api.call` 能力，Host 拒绝转发。对比上游 v4.1.0 manifest 确认其声明了 `api.call`。
+- manifest 补 `api.call` 能力声明。
+- get_msg 失败日志带 RPCError 详情（错误码/原因，截断 200 字符）。
+- 标题反查失败原因透出：`last_search_error` 区分「接口异常（code 412 风控等）」与
+  「接口正常但无结果（冷门/下架）」。
+- 搜索接口加随机 buvid3 cookie：search 类接口无此 cookie 常被 -412 风控。
 
 ## 故障排查
 
