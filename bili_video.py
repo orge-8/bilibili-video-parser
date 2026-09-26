@@ -204,11 +204,21 @@ class BiliVideoClient:
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            cookies = {}
+            cookies = {"buvid3": self._get_buvid3()}
             if self._sessdata:
                 cookies["SESSDATA"] = self._sessdata
             self._client = self._new_client(self._timeout, cookies)
         return self._client
+
+    def _get_buvid3(self) -> str:
+        """随机 buvid3（search 类接口无此 cookie 常被 -412 风控）。
+
+        格式仿真实值: UUIDINFOC。每次进程生成一次，存实例复用。
+        """
+        if not getattr(self, "_buvid3", ""):
+            import uuid
+            self._buvid3 = f"{uuid.uuid4()}INFOC"
+        return self._buvid3
 
     async def _ensure_shortlink_client(self) -> httpx.AsyncClient:
         """短链解析专用：不带 SESSDATA（防凭据随重定向外泄）。"""
@@ -315,17 +325,21 @@ class BiliVideoClient:
     # -- 业务接口 --
 
     async def search_by_title(self, keyword: str) -> VideoTarget | None:
-        """标题关键词搜索 → 取首个视频结果的 VideoTarget（无结果/失败返回 None）。
+        """标题关键词搜索 → 取首个视频结果的 VideoTarget。
 
         用于 QQ 小程序卡片丢 json 载荷时的兜底：卡片文本只剩标题，
         用标题反查 B 站搜索接口拿回视频。需要 WBI 签名。
+        失败原因写入 self.last_search_error（None=成功或未执行）。
         """
         kw = (keyword or "").strip()
+        self.last_search_error = None
         if not kw:
+            self.last_search_error = "空关键词"
             return None
         try:
             mixin_key = await self._ensure_mixin_key()
-        except Exception:
+        except Exception as e:
+            self.last_search_error = f"WBI mixin 获取失败: {type(e).__name__}"
             return None
         params = _wbi_sign({
             "search_type": "video",
@@ -336,9 +350,13 @@ class BiliVideoClient:
         try:
             data = await self._get_json(
                 f"{API_BASE}/x/web-interface/search/type", params)
-        except Exception:
+        except Exception as e:
+            # httpx.HTTPStatusError 的 412 = 未带 cookie 被风控，最常见
+            self.last_search_error = f"搜索接口异常: {type(e).__name__}: {str(e)[:120]}"
             return None
         if data.get("code") != 0:
+            self.last_search_error = (
+                f"搜索接口返回 code={data.get('code')} msg={data.get('message')}")
             return None
         for item in (data.get("data") or {}).get("result") or []:
             # result 里的 type 字段区分视频/直播/用户等，只收视频
@@ -347,6 +365,7 @@ class BiliVideoClient:
             bvid = str(item.get("bvid") or "").strip()
             if bvid.startswith("BV") and len(bvid) == 12:
                 return VideoTarget(bvid)
+        self.last_search_error = "接口正常但无视频结果（冷门/下架/标题偏差）"
         return None
 
     async def get_video_info(self, target: VideoTarget) -> dict[str, Any]:
