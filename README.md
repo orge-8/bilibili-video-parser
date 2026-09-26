@@ -1,8 +1,8 @@
 # bilibili-video-parser（B站视频解析）
 
-MaiBot 插件 `org.mai-mai.bilibili-video-parser` v1.0.0。自动识别聊天中的 B 站视频
-（BV/av 号、bilibili.com 链接、b23.tv 短链），解析内容并注入消息上下文供 bot 理解讨论；
-另提供 `/bili` 命令与 `parse_bilibili_video` 工具。
+MaiBot 插件 `org.mai-mai.bilibili-video-parser` v1.0.4。自动识别聊天中的 B 站视频
+（BV/av 号、bilibili.com 链接、b23.tv 短链、QQ 小程序分享卡片），解析内容并注入消息
+上下文供 bot 理解讨论；另提供 `/bili` 命令与 `parse_bilibili_video` 工具。
 
 参考：[YukiSakiko/content_understanding_plugin](https://github.com/YukiSakiko/content_understanding_plugin)
 （hook 注入形态）、[Mettafy/bilibili_video_parser](https://github.com/Mettafy/bilibili_video_parser)
@@ -26,6 +26,46 @@ MaiBot 插件 `org.mai-mai.bilibili-video-parser` v1.0.0。自动识别聊天中
 | L3 | 纯基础信息（标题/UP主/时长/播放/弹幕/点赞/投币/分P） | 始终可用 |
 
 每次解析的命中级别会写入插件日志，注入文本头部带来源标记（`[AI总结]`/`[关键帧总结]`/`[字幕节选]`/`[简介]`）。
+
+## v1.0.4 修复：NapCat get_msg 回查（根治方案）
+
+- **参考实现**：[Mettafy/bilibili_video_parser](https://github.com/Mettafy/bilibili_video_parser)
+  Maisaka 版 `runtime/napcat_resolver.py`——小程序卡片链接不在 MaiBot 消息体里时，
+  调适配器 API `adapter.napcat.message.get_msg` 回查 NapCat 原始消息（json 段完好）。
+- **兜底链升级**：卡片无链接时 1) NapCat get_msg 回查 → 深度扫描（字符串自动
+  json.loads 展开，dict 按 `jumpUrl`/`qqdocurl`/`meta`/`detail_1`/`miniapp` 等优先键遍历）
+  提取目标；2) 通道不可用/未命中 → 回退标题反查（v1.0.3）。
+- **通道兼容**：`ctx.api.call`（SDK 2.8.2+）→ `call_capability("api.call")`
+  （SDK 2.8.1，Host 支持即可）→ 双通道都失败才回退反查。get_msg 10s 超时。
+
+## v1.0.3 修复：小程序卡片标题反查兜底
+
+- **根因确认**（真机 16:58 日志）：QQ 小程序卡片的 json 载荷在 napcat-adapter → MaiBot
+  管线中被剥掉，`raw_message` 只剩 2 个 text 段（标题文本 + 图片描述），b23 关键词不存在——
+  插件侧无链接可提取。
+- **标题反查兜底**：卡片文本含 `哔哩哔哩：<标题>` 时，用标题调用 B 站搜索接口
+  （`search/type`，WBI 签名）取首个视频结果，走既有解析链注入。反查失败/无结果时静默
+  （仅日志留痕，不注入）。
+- 注入行为与链接解析路径一致（同款缓存、降级链、注入头）。
+
+## v1.0.2 修复：QQ 小程序分享卡片
+
+- **小程序卡片识别**：QQ 哔哩哔哩小程序卡片（ark/json 段）的跳转链接藏在 JSON 字符串里，
+  且为转义形态（`https:\/\/b23.tv\/xxx`）。hook 现在会扫描 raw_message 的 str/list/json 段，
+  还原 `\/`、`\u002F`、`\u0026` 转义后提取 b23 短链并正常解析注入。
+- **诊断埋点**：小程序卡片提取不到目标时输出日志 `小程序卡片未提取到B站目标，原文片段: ...`，
+  用于区分「适配器未转发 json 载荷」与「提取失败」。
+
+## v1.0.1 安全与修复
+
+- **SSRF 加固**：b23.tv 短链解析改为手动跟随跳转 + 域名白名单校验（跳转出白名单即拒绝）；
+  图片/字幕/雪碧图下载仅允许 B 站媒体域（hdslb.com 等），并限制单图 ≤10MB。
+- **注入头防提示注入**：注入文本头部带不可信来源标注（远程视频内容非指令）。
+- **hook 预算与门槛解耦**：hook 总预算 8s 时各级降级门槛同步下调（L1=2s / L2b=15s / L2a=3s），
+  否则 L1 在 hook 路径永不可达；hook 路径默认关闭关键帧识别（`enable_frame_vision_in_hook=false`）。
+- **b23 裸短码修复**：hook 中 `b23.tv/xxxx` 与裸 `b23:xxxx` 均可正确构造目标。
+- **异常信息脱敏**：解析失败不回显重定向 URL 等细节进群聊（防半盲 SSRF 探测），详情仅进日志。
+- **Tool 路径补外层 wait_for**：与命令路径一致的双层超时。
 
 ## 安装
 
@@ -57,8 +97,9 @@ pip install httpx pillow
 | `parse.max_frames` | 4 | 关键帧张数（1~9） |
 | `parse.min_video_duration_sec` | 60 | 低于该时长跳过关键帧 |
 | `credential.sessdata` | "" | B 站 SESSDATA（可选） |
-| `trigger.hook_total_timeout_sec` | 25 | 自动检测链总预算 |
+| `trigger.hook_total_timeout_sec` | 8 | 自动检测链总预算（v1.0.1 由 25 下调，避免阻塞消息主流程） |
 | `trigger.command_total_timeout_sec` | 150 | /bili 命令链总预算 |
+| `trigger.enable_frame_vision_in_hook` | false | hook 路径是否启用 L2b 关键帧识别（默认关闭，命令/Tool 路径不受限） |
 
 ## 权限/能力
 
