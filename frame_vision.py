@@ -10,6 +10,12 @@ import asyncio
 import base64
 import io
 
+# 双路径导入（Runner 包式加载 / fakehost 平铺加载都可用）
+try:
+    from .bili_video import redact_secrets
+except ImportError:  # pragma: no cover
+    from bili_video import redact_secrets
+
 # Pillow 缺失时优雅降级（manifest 已声明，正常环境必装）
 try:
     from PIL import Image
@@ -103,12 +109,33 @@ def _frames_to_data_urls(frames: list[bytes]) -> list[str]:
     return [f"data:image/jpeg;base64,{base64.b64encode(f).decode('ascii')}" for f in frames]
 
 
+def _is_timeout(exc: BaseException) -> bool:
+    """异常是否属于"超时"。
+
+    ⚠ 不能只判 `asyncio.TimeoutError`：本模块的内层 RPC 超时（`timeout_ms=85000`）
+    **先于**外层 `wait_for(90s)` 触发，抛出的是 SDK 的 `RPCError`，其文本形如
+    `[E_TIMEOUT] 请求 cap.call 超时 (85000ms)` —— 它**不是** `asyncio.TimeoutError`。
+    真机 19:55:13 正是这样：内层超时被通用分支吞成"识别失败"，调用方又把
+    `None` 一律说成"VLM 返回空"，于是"超时"被误报成"返回空"，
+    把排查方向从"调大超时/换更快模型"带偏到"改提示词/换模型"。
+    """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    if "timeout" in type(exc).__name__.lower():
+        return True
+    msg = str(exc).lower()
+    return "timeout" in msg or "e_timeout" in msg or "超时" in msg
+
+
 class FrameVisionManager:
     """关键帧 VLM 识别 + 宿主总结。任何失败返回 None（链路继续降级）。"""
 
     def __init__(self, plugin):
         # plugin 提供 self.ctx / self.config / self._resolve_llm_params
         self._plugin = plugin
+        # 最近一次失败的具体原因（v1.0.18）：`analyze()` 返回 None 时由调用方读取，
+        # 避免调用方只能笼统说一句"未产出结果"。空串表示"没失败过/尚未运行"。
+        self.last_failure_reason = ""
 
     async def analyze(self, info: dict, shot_meta: dict,
                       client, sprite_urls: list[str]) -> str | None:
@@ -116,20 +143,28 @@ class FrameVisionManager:
 
         client: bili_video.BiliVideoClient（复用其 download_image）。
         """
+        self.last_failure_reason = ""
         cfg = self._plugin.config.parse
         max_frames = max(1, min(int(cfg.max_frames or 4), 9))
         if not sprite_urls:
+            self.last_failure_reason = "没有可用的雪碧图帧"
             return None
         sprite_bytes = await client.download_image(sprite_urls[0])
         if not sprite_bytes:
+            self.last_failure_reason = "雪碧图下载失败"
             logger.warning(f"雪碧图下载失败: {sprite_urls[0][:100]}")
             return None
         try:
-            frames = _extract_frames(sprite_bytes, shot_meta, max_frames)
+            # audit 第 13 项：PIL 切帧是同步 CPU 密集操作，直接 await 会阻塞事件循环
+            # （期间 bot 收不到任何消息且日志无异常）→ 丢到线程池执行
+            frames = await asyncio.to_thread(
+                _extract_frames, sprite_bytes, shot_meta, max_frames)
         except Exception as e:
-            logger.warning(f"雪碧图切帧失败: {e}")
+            self.last_failure_reason = f"雪碧图切帧异常: {redact_secrets(e)}"
+            logger.warning(f"雪碧图切帧失败: {redact_secrets(e)}")
             return None
         if not frames:
+            self.last_failure_reason = "雪碧图切帧结果为空"
             logger.warning("雪碧图切帧结果为空")
             return None
         desc_max = max(40, min(int(cfg.desc_max_chars or 120), 300))
@@ -160,9 +195,11 @@ class FrameVisionManager:
         """一次多图调用生成帧描述。"""
         llm_kwargs = self._plugin._resolve_vision_params()
         if not llm_kwargs and not self._plugin._vision_fallback_ok():
+            self.last_failure_reason = "视觉任务/模型均未配置"
             logger.warning("视觉任务/模型均未配置，跳过关键帧识别")
             return None
-        data_urls = _frames_to_data_urls(frames)
+        # 同为同步 CPU 操作（最多 9 帧 base64），一并丢线程池
+        data_urls = await asyncio.to_thread(_frames_to_data_urls, frames)
         content = [{"type": "text",
                     "text": _FRAME_DESC_PROMPT.format(n=len(data_urls), max_chars=desc_max)}]
         for url in data_urls:
@@ -172,14 +209,30 @@ class FrameVisionManager:
             result = await self._call_llm(prompt, llm_kwargs,
                                           VISION_TIMEOUT_SEC, VISION_RPC_TIMEOUT_MS)
         except asyncio.TimeoutError:
+            self.last_failure_reason = f"帧描述超时（>{VISION_TIMEOUT_SEC}s）"
             logger.warning(f"关键帧识别超时（>{VISION_TIMEOUT_SEC}s）")
             return None
         except Exception as e:
-            logger.warning(f"关键帧识别失败: {e}")
+            if _is_timeout(e):
+                # 内层 RPC 超时先于外层 wait_for 抛出（见 _is_timeout 注释）
+                self.last_failure_reason = (
+                    f"帧描述超时（RPC {VISION_RPC_TIMEOUT_MS}ms 内未返回）")
+                logger.warning(
+                    f"关键帧识别超时（RPC {VISION_RPC_TIMEOUT_MS}ms）: {redact_secrets(e)}")
+            else:
+                self.last_failure_reason = f"帧描述异常: {redact_secrets(e)}"
+                logger.warning(f"关键帧识别失败: {redact_secrets(e)}")
             return None
         text = self._extract_text(result)
         if not text:
-            logger.warning("关键帧识别返回空文本")
+            # 1.3.0 响应形态可能变化，空文本时打原文结构辅助定位
+            self.last_failure_reason = "VLM 返回空文本（模型未产出内容）"
+            try:
+                import json as _json
+                preview = _json.dumps(result, ensure_ascii=False, default=str)[:300]
+            except Exception:
+                preview = repr(result)[:300]
+            logger.warning(f"关键帧识别返回空文本，响应原文: {preview}")
             return None
         return text
 
@@ -195,20 +248,52 @@ class FrameVisionManager:
             result = await self._call_llm(prompt, llm_kwargs,
                                           SUMMARY_TIMEOUT_SEC, SUMMARY_RPC_TIMEOUT_MS)
         except asyncio.TimeoutError:
+            self.last_failure_reason = f"合成总结超时（>{SUMMARY_TIMEOUT_SEC}s）"
             logger.warning(f"关键帧总结超时（>{SUMMARY_TIMEOUT_SEC}s）")
             return None
         except Exception as e:
-            logger.warning(f"关键帧总结失败: {e}")
+            if _is_timeout(e):
+                self.last_failure_reason = (
+                    f"合成总结超时（RPC {SUMMARY_RPC_TIMEOUT_MS}ms 内未返回）")
+                logger.warning(
+                    f"关键帧总结超时（RPC {SUMMARY_RPC_TIMEOUT_MS}ms）: {redact_secrets(e)}")
+            else:
+                self.last_failure_reason = f"合成总结异常: {redact_secrets(e)}"
+                logger.warning(f"关键帧总结失败: {redact_secrets(e)}")
             return None
-        return self._extract_text(result)
+        text = self._extract_text(result)
+        if not text:
+            self.last_failure_reason = "合成总结返回空文本"
+        return text
 
     @staticmethod
     def _extract_text(result) -> str | None:
-        """从 llm.generate 响应提取正文（兼容多种字段形态）。"""
+        """从 llm.generate 响应提取正文（兼容多种字段形态，递归一层）。"""
+        if isinstance(result, str) and result.strip():
+            return result.strip()
         if not isinstance(result, dict):
             return None
-        for key in ("text", "content", "result", "output"):
+        # Host 统一包装 {success, result}
+        if result.get("success") is True and isinstance(
+                result.get("result"), (dict, str)):
+            inner = FrameVisionManager._extract_text(result["result"])
+            if inner:
+                return inner
+        # OpenAI 风格 choices[0].message.content
+        choices = result.get("choices")
+        if isinstance(choices, list) and choices:
+            msg = choices[0].get("message") if isinstance(
+                choices[0], dict) else None
+            content = (msg or {}).get("content") if isinstance(msg, dict) else None
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+        for key in ("text", "content", "result", "output", "message",
+                    "response", "answer", "data"):
             val = result.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
+            if isinstance(val, dict):
+                inner = FrameVisionManager._extract_text(val)
+                if inner:
+                    return inner
         return None
