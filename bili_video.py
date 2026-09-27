@@ -15,7 +15,7 @@ import hashlib
 import re
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import httpx
 
@@ -42,8 +42,31 @@ _MEDIA_HOST_SUFFIXES = (".hdslb.com", ".bilibili.com", ".bimg.aqzscn.cn")
 # b23 短链解析允许的重定向目标域（安全官 F-001：防止重定向到任意/内网地址）
 _SHORTLINK_HOSTS = {"b23.tv", "www.bilibili.com", "m.bilibili.com", "bilibili.com"}
 _SHORTLINK_MAX_HOPS = 5
+# 媒体下载手动跟随重定向的最大跳数（超限即放弃，防重定向环）
+_MEDIA_MAX_HOPS = 3
 # 单张图片下载上限（10MB，防解压炸弹/资源耗尽）
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+# HTTP 重定向状态码（v1.0.19 起一律不自动跟随：见 _new_client 注释）
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+# 凭据 cookie 的**域限定**：只允许发给 bilibili.com 系主机（含 api.bilibili.com）
+_CREDENTIAL_COOKIE_DOMAIN = ".bilibili.com"
+
+# 日志/异常文本脱敏（audit 第 7 项）：只吃值、保留键名，兼顾排障与防泄漏
+_SECRET_KV_RE = re.compile(
+    r"((?:p_skey|skey|sessdata|buvid3|uin|sid|qzonetoken|pt[a-z_]*|token"
+    r"|password|cookie)\s*[=:]\s*)([^\s;,&\"'）)]+)",
+    re.IGNORECASE,
+)
+
+
+def redact_secrets(text: Any) -> str:
+    """把外部来源字符串（异常对象/响应片段）里的凭据值替换为 <redacted>。
+
+    异常消息常内嵌它请求时用的 cookie 串（`SESSDATA=xxx; ...`），
+    直接 `str(e)` 落日志等于把登录态明文写进日志文件。
+    """
+    return _SECRET_KV_RE.sub(r"\1<redacted>", str(text or ""))
 
 # WBI mixin key 索引表（社区共识，见 bilibili-API-collect）
 _WBI_MIXIN_INDEX = [
@@ -108,7 +131,11 @@ def extract_targets_from_text(text: str) -> list[tuple[str, str]]:
             seen.add(av)
             found.append((av, "av"))
     for m in _B23_RE.finditer(text):
-        found.append((m.group(1), "b23"))
+        code = m.group(1)
+        if code in seen:
+            continue  # 1.3.0 卡片链接在 processed+raw 各出现一次，去重（v1.0.9）
+        seen.add(code)
+        found.append((code, "b23"))
     return found
 
 
@@ -188,26 +215,41 @@ class BiliVideoClient:
         self._timeout = timeout_sec
         self._client: httpx.AsyncClient | None = None
         self._shortlink_client: httpx.AsyncClient | None = None  # 无 cookie，专用于短链解析
+        self._media_client: httpx.AsyncClient | None = None  # 无 cookie，专用于媒体下载
         self._mixin_key = ""
         self._mixin_key_ts = 0.0
 
     # -- 生命周期 --
 
     @staticmethod
-    def _new_client(timeout_sec: float, cookies: dict | None = None) -> httpx.AsyncClient:
+    def _new_client(timeout_sec: float) -> httpx.AsyncClient:
+        """创建出站 client：**不自动跟随重定向**，且不预置任何 cookie。
+
+        v1.0.19 安全修复（audit 第 1/2 项，均已实测复现）：
+        原实现 `httpx.AsyncClient(cookies={...}, follow_redirects=True)` 有两个缺陷 ——
+        ① cookie 落在**无域限定**的 jar 里，任何 302 目标都会收到 `SESSDATA`
+           （实测：媒体域 302 到 evil 域后，evil 拿到完整凭据）；
+        ② 白名单只作用于初始 URL，`follow_redirects=True` 会自行跟随中间跳，
+           使 `_resolve_b23` 的「逐跳校验」形同虚设（实测：非白名单域已收到请求）。
+        现在：重定向由调用方**手动**处理并逐跳校验白名单；凭据按域写入见 `_ensure_client`。
+        """
         return httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_sec),
             headers=dict(_HEADERS),
-            cookies=cookies,
-            follow_redirects=True,
+            follow_redirects=False,
         )
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            cookies = {"buvid3": self._get_buvid3()}
+            client = self._new_client(self._timeout)
+            # 凭据写入**域限定** cookie jar：只会发给 .bilibili.com 系主机，
+            # 跨主机重定向时 httpx 按 jar 重新派生 cookie，非该域拿不到任何凭据。
+            client.cookies.set("buvid3", self._get_buvid3(),
+                               domain=_CREDENTIAL_COOKIE_DOMAIN, path="/")
             if self._sessdata:
-                cookies["SESSDATA"] = self._sessdata
-            self._client = self._new_client(self._timeout, cookies)
+                client.cookies.set("SESSDATA", self._sessdata,
+                                   domain=_CREDENTIAL_COOKIE_DOMAIN, path="/")
+            self._client = client
         return self._client
 
     def _get_buvid3(self) -> str:
@@ -223,11 +265,21 @@ class BiliVideoClient:
     async def _ensure_shortlink_client(self) -> httpx.AsyncClient:
         """短链解析专用：不带 SESSDATA（防凭据随重定向外泄）。"""
         if self._shortlink_client is None or self._shortlink_client.is_closed:
-            self._shortlink_client = self._new_client(self._timeout, None)
+            self._shortlink_client = self._new_client(self._timeout)
         return self._shortlink_client
 
+    async def _ensure_media_client(self) -> httpx.AsyncClient:
+        """媒体下载专用：不带任何 cookie。
+
+        凭据与「能不能取图」解耦（audit 第 1 项坑 B）：域白名单只决定
+        **要不要带凭据**，不决定能不能取 —— 新 CDN 不在名单里也应能下载。
+        """
+        if self._media_client is None or self._media_client.is_closed:
+            self._media_client = self._new_client(self._timeout)
+        return self._media_client
+
     async def close(self) -> None:
-        for attr in ("_client", "_shortlink_client"):
+        for attr in ("_client", "_shortlink_client", "_media_client"):
             c: httpx.AsyncClient | None = getattr(self, attr)
             if c is not None and not c.is_closed:
                 try:
@@ -267,6 +319,9 @@ class BiliVideoClient:
                         extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
         client = await self._ensure_client()
         resp = await client.get(url, params=params, headers=extra_headers)
+        # 3xx 一律判失败：接口不需要跳转，跳转即异常（不回显跳转目标，防半盲探测）
+        if resp.status_code in _REDIRECT_CODES:
+            raise ValueError(f"接口返回重定向({resp.status_code})，已拒绝跟随")
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
@@ -274,9 +329,11 @@ class BiliVideoClient:
         return data
 
     async def _resolve_b23(self, code: str) -> str:
-        """b23.tv 短链 → 目标 URL。逐跳跟随并校验域名白名单（防 SSRF）。
+        """b23.tv 短链 → 目标 URL。逐跳手动跟随并校验域名白名单（防 SSRF）。
 
-        使用无 cookie 专用 client；任一跳落在白名单外即抛 ValueError。
+        使用无 cookie 专用 client；**每一跳**都校验白名单，任一跳落在名单外即抛
+        ValueError。v1.0.19：改为手动跟随（`follow_redirects=False`）——
+        此前依赖 client 自动跟随，白名单实际只作用于初始 URL，中间跳会先发出去。
         """
         client = await self._ensure_shortlink_client()
         url = f"https://b23.tv/{code}"
@@ -285,12 +342,38 @@ class BiliVideoClient:
             if host not in _SHORTLINK_HOSTS:
                 raise ValueError(f"短链重定向到非白名单域: {host}")
             resp = await client.get(url)
-            await resp.aclose()
-            next_url = str(resp.url)
-            if next_url == url:
-                return next_url  # 不再重定向
-            url = next_url
+            try:
+                if resp.status_code in _REDIRECT_CODES:
+                    loc = resp.headers.get("location") or ""
+                    if not loc:
+                        raise ValueError("短链返回重定向但缺少 Location")
+                    url = urljoin(url, loc)
+                    continue
+                return str(resp.url)
+            finally:
+                await resp.aclose()
         raise ValueError("短链重定向次数过多")
+
+    async def _media_get(self, url: str) -> httpx.Response | None:
+        """媒体域 GET：手动跟随重定向，**每一跳都校验媒体域白名单**。
+
+        不用 client 自动重定向：自动跟随会让白名单只作用于初始 URL。
+        返回的响应由调用方负责 `aclose()`；不在白名单/跳数超限返回 None。
+        """
+        client = await self._ensure_media_client()
+        for _hop in range(_MEDIA_MAX_HOPS):
+            if not _is_media_host(url):
+                return None
+            resp = await client.get(url)
+            if resp.status_code in _REDIRECT_CODES:
+                loc = resp.headers.get("location") or ""
+                await resp.aclose()
+                if not loc:
+                    return None
+                url = urljoin(url, loc)
+                continue
+            return resp
+        return None
 
     async def _ensure_mixin_key(self) -> str:
         """nav 接口取 wbi_img 并缓存 mixin key（半小时刷新一次）。"""
@@ -352,7 +435,8 @@ class BiliVideoClient:
                 f"{API_BASE}/x/web-interface/search/type", params)
         except Exception as e:
             # httpx.HTTPStatusError 的 412 = 未带 cookie 被风控，最常见
-            self.last_search_error = f"搜索接口异常: {type(e).__name__}: {str(e)[:120]}"
+            self.last_search_error = redact_secrets(
+                f"搜索接口异常: {type(e).__name__}: {str(e)[:120]}")
             return None
         if data.get("code") != 0:
             self.last_search_error = (
@@ -411,26 +495,45 @@ class BiliVideoClient:
         }
 
     async def get_ai_conclusion(self, info: dict[str, Any]) -> dict[str, Any] | None:
-        """L1 官方 AI 总结。返回 {summary, outline} 或 None（无总结/失败）。"""
+        """L1 官方 AI 总结。返回 {summary, outline} 或 None（无总结/失败）。
+
+        接口: /x/web-interface/view/conclusion/get —— WBI 签名 + SESSDATA
+        双必需（限制游客访问）。失败原因写入 self.last_conclusion_error。
+        """
+        self.last_conclusion_error = None
         if not info.get("cid") or not info.get("bvid"):
+            self.last_conclusion_error = "view 缺少 cid/bvid"
             return None
-        params = {
-            "bvid": info["bvid"],
-            "cid": info["cid"],
-            "up_mid": info.get("owner_mid") or 0,
-        }
         try:
+            mixin_key = await self._ensure_mixin_key()
+            params = _wbi_sign({
+                "bvid": info["bvid"],
+                "cid": info["cid"],
+                "up_mid": info.get("owner_mid") or 0,
+            }, mixin_key)
             data = await self._get_json(
-                f"{API_BASE}/x/web-interface/view/conclusion", params
+                f"{API_BASE}/x/web-interface/view/conclusion/get", params
             )
-        except Exception:
+        except Exception as e:
+            self.last_conclusion_error = redact_secrets(
+                f"conclusion 请求异常: {type(e).__name__}: {str(e)[:120]}")
             return None
         if data.get("code") != 0:
+            # -403 权限不足 = 未带/带错 SESSDATA；-400 请求错误
+            self.last_conclusion_error = (
+                f"conclusion code={data.get('code')} msg={data.get('message')}")
             return None
-        model_result = ((data.get("data") or {}).get("model_result") or {})
+        d = data.get("data") or {}
+        # data.code: 0=有摘要, 1=无摘要(未识别到语音), -1=不支持(敏感内容等)
+        if d.get("code") not in (0, None):
+            self.last_conclusion_error = (
+                f"data.code={d.get('code')}（1=未识别到语音, -1=不支持AI摘要）")
+            return None
+        model_result = d.get("model_result") or {}
         summary = str(model_result.get("summary") or "").strip()
         outline = model_result.get("outline") or []
         if not summary and not outline:
+            self.last_conclusion_error = "model_result 为空（无摘要内容）"
             return None
         # outline: [{title, part_outline: [{timestamp, content}]}]
         return {"summary": summary, "outline": outline}
@@ -463,10 +566,14 @@ class BiliVideoClient:
         if not _is_media_host(sub_url):
             return None  # 字幕 URL 不在 B 站媒体域白名单内，放弃（安全 F-001）
         try:
-            client = await self._ensure_client()
-            resp = await client.get(sub_url)
-            resp.raise_for_status()
-            body = resp.json()
+            resp = await self._media_get(sub_url)
+            if resp is None:
+                return None
+            try:
+                resp.raise_for_status()
+                body = resp.json()
+            finally:
+                await resp.aclose()
         except Exception:
             return None
         lines = [str(item.get("content") or "") for item in body.get("body") or []]
@@ -501,17 +608,34 @@ class BiliVideoClient:
         }
 
     async def download_image(self, url: str) -> bytes | None:
-        """下载雪碧图（仅限 B 站媒体域白名单 + 大小上限）。失败返回 None。"""
+        """下载雪碧图（仅限 B 站媒体域白名单 + 大小上限 + 逐跳白名单）。
+
+        走**无 cookie** 专用 client，且手动跟随重定向（每跳校验白名单）：
+        媒体 CDN 跳转不能成为凭据外泄或 SSRF 的出口。
+        """
         if not url:
             return None
         if url.startswith("//"):
             url = "https:" + url
-        if not _is_media_host(url):
-            return None
-        try:
-            client = await self._ensure_client()
-            resp = await client.send(client.build_request("GET", url), stream=True)
+        client = await self._ensure_media_client()
+        for _hop in range(_MEDIA_MAX_HOPS):
+            if not _is_media_host(url):
+                return None
             try:
+                req = client.build_request("GET", url)
+                resp = await client.send(req, stream=True)
+            except Exception:
+                return None
+            if resp.status_code in _REDIRECT_CODES:
+                loc = resp.headers.get("location") or ""
+                await resp.aclose()
+                if not loc:
+                    return None
+                url = urljoin(url, loc)
+                continue
+            try:
+                if not resp.is_success:
+                    return None
                 length = resp.headers.get("content-length")
                 if length and int(length) > _MAX_IMAGE_BYTES:
                     return None
@@ -523,10 +647,11 @@ class BiliVideoClient:
                         return None
                     chunks.append(chunk)
                 return b"".join(chunks)
+            except Exception:
+                return None
             finally:
                 await resp.aclose()
-        except Exception:
-            return None
+        return None
 
 
 def format_count(n: int) -> str:

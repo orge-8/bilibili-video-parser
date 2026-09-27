@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "org.mai-mai.bilibili-video-parser",
-  "version": "1.0.5",
+  "version": "1.0.19",
   "name": "B站视频解析",
   "description": "自动识别聊天中的B站视频（BV/av号、bilibili.com链接、b23.tv短链），三级降级解析视频内容：官方AI总结 → 关键帧VLM识别+宿主总结/CC字幕/简介 → 基础信息，解析结果注入消息上下文供bot理解讨论（不刷屏）；另提供 /bili 命令与 parse_bilibili_video 工具显式查询。SESSDATA 可选。",
   "author": {
