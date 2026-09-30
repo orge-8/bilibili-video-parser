@@ -298,20 +298,26 @@ class BiliVideoClient:
             except Exception:
                 pass
 
-    def update_sessdata(self, sessdata: str) -> None:
-        """更新 SESSDATA。返回 True 表示 client 需要重建（异步重建由调用方触发）。"""
-        sd = (sessdata or "").strip()
-        if sd != self._sessdata:
-            self._sessdata = sd
-            self._client = None  # 下一轮 _ensure_client 重建；旧 client 由 close 统一兜底
-            self._dirty = True
+    def update_sessdata(self, sessdata: str) -> bool:
+        """更新 SESSDATA。返回 True 表示有变化，调用方应触发 client 重建
+        （异步上下文里 `await _swap_client()`，显式关闭旧 client 的连接池）。
 
-    def update_timeout(self, timeout_sec: float) -> None:
-        """更新超时；下一次 _ensure_client 生效（client 置空触发重建）。"""
+        v1.0.20 之前这里直接 `self._client = None`：旧 AsyncClient 未 aclose()，
+        每次 Runner 推配置泄漏一个连接池（socket 靠 GC 兜底）。
+        """
+        sd = (sessdata or "").strip()
+        if sd == self._sessdata:
+            return False
+        self._sessdata = sd
+        return True
+
+    def update_timeout(self, timeout_sec: float) -> bool:
+        """更新超时。返回 True 表示有变化，调用方应触发 client 重建。"""
         t = max(1.0, float(timeout_sec or 15.0))
-        if t != self._timeout:
-            self._timeout = t
-            self._client = None
+        if t == self._timeout:
+            return False
+        self._timeout = t
+        return True
 
     # -- 内部 --
 

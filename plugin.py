@@ -1,4 +1,4 @@
-"""org.mai-mai.bilibili-video-parser —— B站视频解析插件（v1.0.16）
+"""org.mai-mai.bilibili-video-parser —— B站视频解析插件（v1.0.21）
 
 自动识别聊天中的 B 站视频（BV/av 号、bilibili.com 链接、b23.tv 短链），解析视频内容
 并注入消息上下文（改写 processed_plain_text，不发冗余卡片），供 bot 理解讨论；
@@ -55,6 +55,32 @@
 planner/replyer 两通道投齐、条目被**当场回收** ⇒ 读到空 ⇒ 显示 `—`，读起来像
 "什么都没注入"。现改为读**本次实际投递的条目**，并附带"仍在队列/已回收"状态。
 
+待注入 TTL 放宽 + 过期留痕（v1.0.21）：真机 09-30 20:41 复盘——关键帧总结
+20:41:57 入队后，低活跃群（回复频率 0.2 + 消息防抖）直到 20:59:04 才等来
+首次 planner 请求（距入队 1027s），超过旧 TTL 900s，条目被 _purge_pending
+**静默**清掉：注入永不发生，planner dump 全文 grep「画面内容」0 命中，
+且日志零行（_diag_no_inject 的"最近入队"判断与 TTL 同窗，同步超窗）。
+修法：① TTL 900→7200（2h，覆盖低频群典型空窗，话题此时一般未冷）；
+② _purge_pending 丢弃「过期且未投满两通道」的条目时 INFO 留痕
+（存活时长/已投通道/会话键/通常原因），投满的正常回收不打。
+
+性能/内存专项（v1.0.20）：静态分析全量代码后收敛的 9 项——
+① `_inject_pending` 空队列短路：该 hook 挂在每次 planner/replyer 模型请求上，
+   此前队列 99% 为空时仍 `_purge_pending()` 全表扫描 + `_payload_text()` 把
+   整份上下文 items（可达数万字符）拼成大字符串；现在队列与入队痕迹皆空即返回；
+② `on_incoming_message` 接入 `_has_target_hint` 预筛（该函数早已定义却从未
+   接线，每条普通消息白跑 4 条正则 finditer；hint=False 仍落入卡片兜底分支）；
+③ 后台关键帧任务复用 hook 链已解析的 real_target/info（`_resolve_video_full`
+   新返回值），每个视频省 resolve + view 两次 API 往返；缓存命中时保持旧路径；
+④ `_injected_recently` / ⑤ `_diag_last` 两处无界字典补时间窗有界化
+   （此前只写不删，长跑缓慢泄漏）；
+⑥ `_cache_put` 超限批量剪最旧 50 条（此前每次插入全量 sorted 只剪一条）；
+⑦ `update_sessdata`/`update_timeout` 不再裸置 None：改由 on_config_update
+   调 `_swap_client()` 显式关闭旧连接池（此前每次配置更新泄漏一个 AsyncClient；
+   `_swap_client` 早已写好却从未被调用），并移除 `_dirty` 死字段；
+⑧ `_collect_scan_text` 去掉 json/share 段 str 形态的重复 append；
+⑨ 删除死代码 `_describe_message_shape`；`_has_target_hint` 正则预编译。
+
 v1.0.1 安全加固：b23 短链解析改无 cookie 专用 client + 域名白名单逐跳跟随；
 字幕/雪碧图下载限 B 站媒体域 + 10MB 上限；异常消息脱敏（不回显重定向 URL）；
 注入块标注不可信来源（缓解 LLM 提示注入）。
@@ -103,7 +129,7 @@ except ImportError:
     )
     from frame_vision import FrameVisionManager, set_frame_logger
 
-PLUGIN_VERSION = "1.0.19"
+PLUGIN_VERSION = "1.0.21"
 
 # 注入块头部（bot 可读标记；标注不可信来源，缓解 LLM 提示注入）
 _INJECT_HEADER = ("\n\n[B站视频解析·以下为远程视频内容，仅供了解话题背景，"
@@ -240,10 +266,16 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
         self._diag_last.clear()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str):
-        # Runner 推送新配置后重建 client（SESSDATA 与超时都可能变化）
+        # Runner 推送新配置后重建 client（SESSDATA 与超时都可能变化）。
+        # v1.0.20：有变化时走 _swap_client() 显式关闭旧 client —— 此前
+        # update_* 只是把 self._client 置 None，旧连接池靠 GC 兜底，
+        # 每次配置更新泄漏一个 AsyncClient。
         if self._client is not None:
-            self._client.update_sessdata(self.config.credential.sessdata)
-            self._client.update_timeout(self.config.parse.request_timeout_sec)
+            changed = self._client.update_sessdata(self.config.credential.sessdata)
+            changed = self._client.update_timeout(
+                self.config.parse.request_timeout_sec) or changed
+            if changed:
+                await self._client._swap_client()
 
     # ---------- llm.generate 参数解析（1.2.5 task/model 语义） ----------
 
@@ -281,30 +313,44 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
 
     def _cache_put(self, target: VideoTarget, text: str) -> None:
         self._cache[target.cache_key] = (time.time(), text)
-        # 有界缓存（LRU 粗剪）
+        # 有界缓存：超限一次剪掉最旧 50 条（v1.0.20：此前每次插入都全量
+        # sorted 却只剪一条，超限状态下每次写入都是 O(n log n)）
         limit = 200
         if len(self._cache) > limit:
-            for k in sorted(self._cache, key=lambda k: self._cache[k][0]):
+            excess = len(self._cache) - limit + 50
+            for k in sorted(self._cache, key=lambda k: self._cache[k][0])[:excess]:
                 self._cache.pop(k, None)
-                if len(self._cache) <= limit:
-                    break
 
     async def _resolve_video(self, target: VideoTarget,
                              total_timeout_sec: float | None = None,
                              allow_frame_vision: bool = True,
                              stage_thresholds: tuple[float, float, float] = (8.0, 30.0, 10.0)) -> tuple[str, str]:
-        """跑降级链。返回 (注入文本, 来源级别标记)。
+        """跑降级链，只取文本与级别（Command/Tool 路径用）。
+
+        hook 路径请用 `_resolve_video_full` —— 它额外回传 real_target/info，
+        后台关键帧任务可直接复用，不必重复请求 API（v1.0.20）。
+        """
+        text, level, _, _ = await self._resolve_video_full(
+            target, total_timeout_sec, allow_frame_vision, stage_thresholds)
+        return text, level
+
+    async def _resolve_video_full(self, target: VideoTarget,
+                                  total_timeout_sec: float | None = None,
+                                  allow_frame_vision: bool = True,
+                                  stage_thresholds: tuple[float, float, float] = (8.0, 30.0, 10.0)) -> tuple[str, str, VideoTarget, dict | None]:
+        """跑降级链。返回 (注入文本, 来源级别标记, 解析后目标, 视频信息)。
 
         级别标记：ai_summary / frame_vision / subtitle / desc / basic / cache
         allow_frame_vision=False 时跳过 L2b 关键帧（hook 路径用，避免阻塞消息主流程）。
         stage_thresholds: (L1, L2b, L2a) 各级剩余预算门槛。hook 路径传低门槛版，
         否则 hook 总预算 8s < L1 门槛 8s，L1 在 hook 路径永远不可达（死锁式配置）。
+        缓存命中时 info 为 None（缓存只存最终文本，未存 info）。
         """
         need_ai, need_frame, need_sub = stage_thresholds
         logger = self.ctx.logger
         cached = self._cache_get(target)
         if cached:
-            return cached, "cache"
+            return cached, "cache", target, None
 
         budget: float | None = None
         if total_timeout_sec and total_timeout_sec > 0:
@@ -323,7 +369,7 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
             if cached:
                 # 顺手把短链 key 也指向该结果，下次直接命中
                 self._cache_put(target, cached)
-                return cached, "cache"
+                return cached, "cache", real_target, None
         info = await self._client.get_video_info(real_target)
         basic_block = self._format_basic(info)
 
@@ -336,7 +382,7 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                 self._cache_put(real_target, text)
                 self._cache_put(target, text)  # b23 原始 key 同步可命中
                 logger.info(f"视频解析命中 L1 官方总结: {real_target.video_id}")
-                return text, "ai_summary"
+                return text, "ai_summary", real_target, info
             logger.info(
                 f"官方 AI 总结不可用，降级 L2: {real_target.video_id} "
                 f"| {getattr(self._client, 'last_conclusion_error', None) or '未知原因'}")
@@ -360,7 +406,7 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                     self._cache_put(real_target, text)
                     self._cache_put(target, text)
                     logger.info(f"视频解析命中 L2 关键帧: {real_target.video_id}")
-                    return text, "frame_vision"
+                    return text, "frame_vision", real_target, info
                 logger.info(
                     f"关键帧识别未产出结果（{self._vision_failure_reason()}），"
                     f"尝试字幕: {real_target.video_id}")
@@ -374,7 +420,7 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                 self._cache_put(real_target, text)
                 self._cache_put(target, text)
                 logger.info(f"视频解析命中 L2 字幕: {real_target.video_id}")
-                return text, "subtitle"
+                return text, "subtitle", real_target, info
 
         # L2c 简介 + L3
         desc = str(info.get("desc") or "").strip()
@@ -384,13 +430,13 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
             self._cache_put(real_target, text)
             self._cache_put(target, text)
             logger.info(f"视频解析命中 L2 简介: {real_target.video_id}")
-            return text, "desc"
+            return text, "desc", real_target, info
 
         text = self._clip(_INJECT_HEADER + "\n" + basic_block)
         self._cache_put(real_target, text)
         self._cache_put(target, text)
         logger.info(f"视频解析命中 L3 基础信息: {real_target.video_id}")
-        return text, "basic"
+        return text, "basic", real_target, info
 
     @staticmethod
     def _within_budget(left: float | None, need: float) -> bool:
@@ -462,7 +508,11 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
 
         # 目标提取：processed 文本 + raw 兜底（字符串 / 段列表 / json 小程序卡片）
         scan_text = self._collect_scan_text(message)
-        hits = extract_targets_from_text(scan_text)
+        # v1.0.20：先做子串级快速预筛（此前 `_has_target_hint` 已定义却未接线，
+        # 每条普通消息都白跑 4 条正则 finditer）。hint=False 时 hits 为空，
+        # 自然落入下方 `if not hits:` 的卡片兜底分支，行为不变。
+        hits = extract_targets_from_text(scan_text) \
+            if _has_target_hint(scan_text) else []
         message_id = str(message.get("message_id") or "")
         if not hits:
             # 小程序卡片兜底链：json 载荷被管线剥掉时（真机 16:58 实证
@@ -492,7 +542,9 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
 
         budget = float(self.config.trigger.hook_total_timeout_sec or 8.0)
         inject_blocks: list[str] = []
-        resolved_targets: list[VideoTarget] = []
+        # (原始 target, 解析后 real_target, 已取到的 info) —— info 透传给后台
+        # 关键帧任务复用，省一次 view 接口往返（v1.0.20）；缓存命中时 info=None
+        resolved_targets: list[tuple[VideoTarget, VideoTarget, dict | None]] = []
         seen_blocks: set[str] = set()   # 循环内块去重（同视频多链接形态）
         now_ts = time.time()
         iter_start = time.monotonic()  # 逐迭代计时起点
@@ -512,8 +564,8 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                 continue
             left = budget
             try:
-                block_text, level = await asyncio.wait_for(
-                    self._resolve_video(
+                block_text, level, real_t, info = await asyncio.wait_for(
+                    self._resolve_video_full(
                         target, total_timeout_sec=max(1.0, left),
                         # hook 轻量路径永远跳过 L2b（关键帧走后台注入）
                         allow_frame_vision=False,
@@ -533,11 +585,11 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                         f"同视频多链接去重: {target.video_id}")
                     continue
                 seen_blocks.add(block_text)
-                self._injected_recently[target.cache_key] = time.time()
+                self._note_injected_recently(target.cache_key)
                 inject_blocks.append(block_text)
                 # L1 官方总结已够丰富，不再后台跑关键帧（省 20~56s VLM 调用）
                 if level != "ai_summary":
-                    resolved_targets.append(target)
+                    resolved_targets.append((target, real_t, info))
             except asyncio.TimeoutError:
                 # 总预算耗尽：至少留下标记行，供 bot 知道这是一个B站视频
                 inject_blocks.append(_INJECT_HEADER + "（解析超时，内容未获取）")
@@ -564,26 +616,50 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
             message["text"] = message["text"] + merged
         # 关键帧后台注入：hook 轻量注入完成后，合格视频异步跑关键帧
         # 识别+宿主总结，完成后在后续模型请求中注入上下文（v1.0.12 用户选定）
-        for tgt in resolved_targets:
-            self._spawn_background_frame_vision(tgt, message)
+        for tgt, real_t, info in resolved_targets:
+            self._spawn_background_frame_vision(
+                tgt, message, real_target=real_t, info=info)
         return {"action": "continue", "modified_kwargs": kwargs}
+
+    def _note_injected_recently(self, cache_key: str) -> None:
+        """登记一次注入（带去重表有界化，v1.0.20）。
+
+        `_injected_recently` 此前只写不删，长跑下每注入一个视频永久留一条。
+        清理窗与 300s 判重窗一致，语义零变化。
+        """
+        if len(self._injected_recently) > 512:
+            now = time.time()
+            self._injected_recently = {
+                k: v for k, v in self._injected_recently.items()
+                if now - v < 300
+            }
+        self._injected_recently[cache_key] = time.time()
 
     # ---------- 关键帧后台识别（hook 轻量注入后的异步增强） ----------
 
     _BG_COOLDOWN_SEC = 1800       # 同视频 30 分钟内只后台识别一次
     _BG_SUMMARY_MAX_CHARS = 900   # 总结正文长度上限（防上下文膨胀）
-    _BG_PENDING_TTL_SEC = 900     # 待注入总结有效期（15 分钟，过期不再注入）
+    # v1.0.21：900 → 7200。真机 09-30 20:41 复盘：总结 20:41:57 入队，但低活跃群
+    # （频率 0.2 + 防抖）直到 20:59:04 才等来首次模型请求 —— 距入队 1027s > 900s，
+    # 条目被 _purge_pending 静默清掉，注入永不发生且零行日志（_diag_no_inject 的
+    # "最近入队"判断也用同一窗口，同步超窗）。2h 覆盖低频群典型空窗，话题未冷。
+    _BG_PENDING_TTL_SEC = 7200    # 待注入总结有效期（2 小时，过期不再注入）
     _BG_MAX_PENDING_PER_SESSION = 3   # 单会话待注入队列上限（超出丢最旧）
     # 允许投递的通道（各 1 次，两者都投过才回收）。顺序无关，仅作完整性判据。
     _BG_INJECT_CHANNELS = ("planner", "replyer")
 
     def _spawn_background_frame_vision(self, target: VideoTarget,
-                                       message: dict) -> None:
+                                       message: dict,
+                                       real_target: VideoTarget | None = None,
+                                       info: dict | None = None) -> None:
         """为已注入的视频孵化后台关键帧任务（不阻塞 hook 返回）。
 
         v1.0.13：每个静默 return 都补一条日志 —— 真机 16:16 复盘时，
         后台链路"孵化→解析→信息→雪碧图→VLM→入队"全段无日志，导致既无法
         判断任务是否孵化，也无法判断卡在哪一级，只能靠猜。排查成本高于日志噪音。
+
+        v1.0.20：real_target/info 由 hook 解析链透传（缓存命中时为 None），
+        后台任务直接复用，每个视频省一次 resolve + 一次 view 接口往返。
         """
         logger = self.ctx.logger
         if not self.config.parse.enable_frame_vision:
@@ -614,7 +690,9 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                 f"已识别过（{target.video_id}）")
             return
         self._bg_sent[key] = now
-        task = asyncio.create_task(self._bg_frame_vision_task(target, message))
+        task = asyncio.create_task(
+            self._bg_frame_vision_task(target, message,
+                                       real_target=real_target, info=info))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
         logger.info(
@@ -622,7 +700,9 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
             f" {target.video_id}")
 
     async def _bg_frame_vision_task(self, target: VideoTarget,
-                                    message: dict) -> None:
+                                    message: dict,
+                                    real_target: VideoTarget | None = None,
+                                    info: dict | None = None) -> None:
         """后台关键帧识别 + 宿主总结 → 入待注入队列（不阻塞、不发消息）。
 
         v1.0.13 两处修正：
@@ -634,6 +714,10 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
         v1.0.14：耗时要**分到每一级**。真机 16:33 实测总耗时 63.7s，但日志
         只有总数，看不出是雪碧图慢还是 VLM 慢 —— 而"要不要调小 max_frames /
         换个视觉模型"完全取决于这个分布。所以完成/失败日志都带分级耗时。
+
+        v1.0.20：real_target/info 由 hook 链透传时直接复用（此前每个视频
+        在这里重复 resolve + view 两次 API 往返）；缓存命中/info 缺失时
+        保持原有的重新请求路径。
         """
         logger = self.ctx.logger
         t0 = time.monotonic()
@@ -654,8 +738,10 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
 
         try:
             # 先解析短链（主循环收集的是原始 target，b23: 形态直接喂
-            # view 接口会 -400，真机 13:52 实测）
-            real_target = await self._client.resolve_target(target)
+            # view 接口会 -400，真机 13:52 实测）；hook 链透传 real_target
+            # 时跳过（v1.0.20：省一次 resolve 往返）
+            if real_target is None:
+                real_target = await self._client.resolve_target(target)
             vid = real_target.video_id or target.video_id
             raw_key = target.cache_key
             key = real_target.cache_key
@@ -670,8 +756,11 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                     f"耗时 {time.monotonic() - t0:.1f}s）: {vid}")
                 return
             self._bg_sent[key] = now
-            _step("取视频信息")
-            info = await self._client.get_video_info(real_target)
+            if info is None:
+                _step("取视频信息")
+                info = await self._client.get_video_info(real_target)
+            else:
+                _step("复用视频信息")
             min_dur = int(self.config.parse.min_video_duration_sec or 60)
             duration = int(info.get("duration") or 0)
             if duration < min_dur:
@@ -802,12 +891,22 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
         """
         now = now if now is not None else time.time()
         need = set(self._BG_INJECT_CHANNELS)
+        # v1.0.21：过期且未投满的条目必须留痕 —— 真机 09-30 复盘，低活跃群
+        # 首次模型请求距入队 1027s（超旧 900s TTL），条目被静默清掉，
+        # 注入永不发生且日志零行。两通道投完/TTL 内属正常路径，不打。
+        expired_undelivered: list[tuple[str, dict, float]] = []
         for stream_id in list(self._bg_pending):
-            kept = [
-                e for e in self._bg_pending[stream_id]
-                if now - float(e.get("ts") or 0) < self._BG_PENDING_TTL_SEC
-                and not set(e.get("channels") or ()) >= need
-            ]
+            kept = []
+            for e in self._bg_pending[stream_id]:
+                age = now - float(e.get("ts") or 0)
+                delivered = set(e.get("channels") or ()) >= need
+                if age >= self._BG_PENDING_TTL_SEC:
+                    if not delivered:
+                        expired_undelivered.append((stream_id, e, age))
+                    continue  # 过期一律清
+                if delivered:
+                    continue  # 两通道均已投递，正常回收
+                kept.append(e)
             if kept:
                 self._bg_pending[stream_id] = kept
             else:
@@ -817,6 +916,13 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                 # 删除，恰好把"曾入队 → 队列被清空"这一异常的证据一起抹掉了，
                 # 于是本该告警的场景反而静默 —— 诊断自己制造了新的日志盲区。
                 self._bg_served[stream_id] = now
+        if expired_undelivered and self.ctx:
+            for sid, e, age in expired_undelivered:
+                self.ctx.logger.info(
+                    f"待注入总结过期未投完（存活 {age:.0f}s，"
+                    f"已投通道={sorted(e.get('channels') or ())}；会话 {sid[:8]}…；"
+                    f"通常意味着该会话在 TTL 内未发起 planner/replyer 请求）"
+                    f": {e.get('video_id')}")
         # 诊断痕迹只按时间裁剪（保留 2×TTL，覆盖 TTL 判定窗口）
         keep_from = now - self._BG_PENDING_TTL_SEC * 2
         if len(self._bg_enqueued) > 200:
@@ -918,6 +1024,17 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                 chunks.append(item["content"])
         return "\n".join(chunks)
 
+    def _diag_mark(self, key: str, now: float) -> None:
+        """登记一次诊断提示（带节流表有界化，v1.0.20）。
+
+        `_diag_last` 此前只写不删，长跑下每个 (通道, 会话) 永久留一条。
+        清理窗取 60s 节流窗的 5 倍余量，不影响节流判定。
+        """
+        if len(self._diag_last) > 200:
+            self._diag_last = {
+                k: v for k, v in self._diag_last.items() if now - v <= 300.0}
+        self._diag_last[key] = now
+
     def _diag_no_inject(self, session_id: str, channel: str,
                         reason: str) -> None:
         """注入未发生时的统一诊断（v1.0.15 起，v1.0.16 补齐盲区）。
@@ -951,7 +1068,7 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                 return
             if now - self._diag_last.get(key, 0.0) < 60.0:
                 return
-            self._diag_last[key] = now
+            self._diag_mark(key, now)
             self.ctx.logger.warning(
                 f"关键帧注入异常：{channel} 队列有 {len(entries)} 条却取不出文本"
                 f"（会话 {session_id}，实例 {hex(id(self))}；{reason}）")
@@ -969,7 +1086,7 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                       if now - v < 120.0}
             if not recent or now - self._diag_last.get(key, 0.0) < 60.0:
                 return
-            self._diag_last[key] = now
+            self._diag_mark(key, now)
             self.ctx.logger.warning(
                 f"关键帧注入未命中：{channel} 本会话 {session_id} 从未入过队，"
                 f"但 {len(recent)} 个会话在 120s 内刚入过队（{list(recent)}）"
@@ -984,7 +1101,7 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
             return  # 队列被正常清空（两通道都投过），不算异常
         if now - self._diag_last.get(key, 0.0) < 60.0:
             return  # 同一 (通道, 会话) 60s 内只提示一次
-        self._diag_last[key] = now
+        self._diag_mark(key, now)
         self.ctx.logger.warning(
             f"关键帧注入未命中：{channel} 会话 {session_id} 于 {age:.0f}s 前"
             f"入过待注入队列，但队列里已查不到该项、也没有正常结束记录"
@@ -1035,6 +1152,16 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                     f"关键帧注入：{channel} 请求里没有 session_id/chat_id，"
                     f"注入被跳过（本通道只提示一次；"
                     f"载荷字段={sorted(kwargs.keys())}）")
+            return {}
+
+        # 空队列快速路径（v1.0.20）：本 hook 挂在 planner/replyer 每次模型请求上，
+        # 而 99% 的请求并没有待注入总结 —— 此前无条件 `_purge_pending()` 全表扫描
+        # + `_payload_text()` 把整份上下文 items（可达数万字符）拼成大字符串。
+        # 队列与入队痕迹都为空时，诊断分支（`_diag_no_inject` 的三种可疑情形）
+        # 必然全部保持安静，直接返回不改变任何可观测行为。
+        # 注意必须放在 session_id 校验**之后**：缺 session_id 的告警是
+        # "整个注入功能失效"的唯一可见信号，不能被空队列短路吞掉。
+        if not self._bg_pending and not self._bg_enqueued:
             return {}
 
         # 完整替换语义的安全基线：原样带上全部字段，只覆盖需要改的键
@@ -1155,6 +1282,9 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
 
     @classmethod
     def _unescape_json_url(cls, s: str) -> str:
+        # v1.0.20：无反斜杠就没有转义可还原，直接返回原串跳过正则全串扫描
+        if "\\" not in s:
+            return s
         def _repl(m: "re.Match") -> str:
             if m.group("slash") or m.group("bs"):
                 return "/"
@@ -1182,36 +1312,15 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
                     parts.append(str(data.get("data") or ""))
                     parts.append(str(data.get("url") or ""))
                     parts.append(str(data.get("text") or ""))
+                    if stype in ("json", "share"):
+                        # json 段整个字符串兜底（字段名不定，宁可多扫）。
+                        # v1.0.20：仅 dict 形态追加整段 —— data 为 str 时上面
+                        # elif 已原样收过一遍，再 str(data) 是完全相同的重复。
+                        parts.append(str(data))
                 elif isinstance(data, str):
                     parts.append(data)
-                if stype in ("json", "share"):
-                    # json 段整个字符串兜底（字段名不定，宁可多扫）
-                    parts.append(str(data or ""))
         scan = "\n".join(p for p in parts if p)
         return cls._unescape_json_url(scan)
-
-    @classmethod
-    def _describe_message_shape(cls, message: dict) -> str:
-        """消息结构摘要（只出字段名/类型/段类型/长度，不出内容，防泄漏）。"""
-        parts = []
-        for key, val in message.items():
-            if isinstance(val, list):
-                segs = []
-                for seg in val[:6]:
-                    if isinstance(seg, dict):
-                        stype = str(seg.get("type") or "?")
-                        data = seg.get("data")
-                        dtype = (type(data).__name__ or "?")
-                        dlen = len(repr(data)) if data is not None else 0
-                        segs.append(f"{stype}({dtype},{dlen})")
-                    else:
-                        segs.append(type(seg).__name__)
-                parts.append(f"{key}=list[{len(val)}]({','.join(segs)})")
-            elif isinstance(val, dict):
-                parts.append(f"{key}=dict({','.join(list(val.keys())[:8])})")
-            else:
-                parts.append(f"{key}={type(val).__name__}({len(str(val))})")
-        return " ".join(parts)
 
     # 卡片特征前缀（参考上游 Maisaka 版 napcat_resolver._CARD_PREFIXES）
     _CARD_PREFIXES = ("[小程序]", "[json", "[xml]", "[share]")
@@ -1308,8 +1417,8 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
         """解析目标并注入消息（get_msg/标题反查兜底共用的收尾）。"""
         budget = float(self.config.trigger.hook_total_timeout_sec or 8.0)
         try:
-            block_text, level = await asyncio.wait_for(
-                self._resolve_video(
+            block_text, level, real_t, info = await asyncio.wait_for(
+                self._resolve_video_full(
                     target, total_timeout_sec=max(1.0, budget),
                     allow_frame_vision=False,  # 关键帧走后台注入
                     stage_thresholds=(2.0, 15.0, 3.0)),
@@ -1331,7 +1440,8 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
             message["text"] = message["text"] + block_text
         # L1 命中不需要关键帧后台注入（官方总结已够丰富）
         if level != "ai_summary":
-            self._spawn_background_frame_vision(target, message)
+            self._spawn_background_frame_vision(
+                target, message, real_target=real_t, info=info)
         return True
 
     async def _napcat_get_msg(self, message_id: str) -> dict | None:
@@ -1495,6 +1605,11 @@ class BilibiliVideoParserPlugin(MaiBotPlugin):
             return "解析失败（目标不可达或非B站视频）"
 
 
+# v1.0.20：预筛正则提升为模块级预编译（此前每次调用靠 re 模块缓存兜底）
+_HINT_BV_RE = re.compile(r"bv[0-9a-z]{10}")
+_HINT_AV_RE = re.compile(r"av\d{4,}")
+
+
 def _has_target_hint(text: str) -> bool:
     """轻量判断：文本里是否有 B 站视频痕迹（避免对普通消息跑完整正则）。
 
@@ -1503,9 +1618,9 @@ def _has_target_hint(text: str) -> bool:
     low = text.lower()
     if "b23.tv" in low or "bilibili.com" in low:
         return True
-    if re.search(r"bv[0-9a-z]{10}", low):
+    if _HINT_BV_RE.search(low):
         return True
-    return bool(re.search(r"av\d{4,}", low))
+    return bool(_HINT_AV_RE.search(low))
 
 
 def create_plugin() -> BilibiliVideoParserPlugin:
